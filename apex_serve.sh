@@ -59,6 +59,84 @@ _in_use() {
     return 1
 }
 
+# Identify which process is holding a port. Returns a single human-readable
+# line like "pid=1234 proc=python3 user=kali" or "" if we couldn't tell
+# (often: held by another user and we're not root).
+_who_uses_port() {
+    local p="$1" line
+    # ss with process info (needs root for other users' procs, but always
+    # tells us OUR own procs and at least the program name when readable)
+    if command -v ss >/dev/null 2>&1; then
+        line=$(ss -ltnp 2>/dev/null | awk -v port=":$p" '$4 ~ port"$" {print; exit}')
+        if [ -n "$line" ]; then
+            # Extract users:(("name",pid=N,fd=M))
+            local proc pid
+            proc=$(printf '%s' "$line" | grep -oE 'users:\(\("[^"]+"' | head -1 | sed 's/.*"\([^"]*\)"/\1/')
+            pid=$(printf '%s' "$line"  | grep -oE 'pid=[0-9]+' | head -1 | cut -d= -f2)
+            if [ -n "$proc" ] || [ -n "$pid" ]; then
+                printf 'pid=%s proc=%s' "${pid:-?}" "${proc:-?}"
+                return 0
+            fi
+        fi
+    fi
+    # lsof fallback
+    if command -v lsof >/dev/null 2>&1; then
+        line=$(lsof -nP -iTCP:"$p" -sTCP:LISTEN 2>/dev/null | awk 'NR==2{print $1" "$2" "$3}')
+        if [ -n "$line" ]; then
+            printf 'proc=%s pid=%s user=%s' $line
+            return 0
+        fi
+    fi
+    # fuser fallback
+    if command -v fuser >/dev/null 2>&1; then
+        line=$(fuser -n tcp "$p" 2>/dev/null | tr -s ' ' | sed 's/^ *//')
+        [ -n "$line" ] && { printf 'pid=%s' "$line"; return 0; }
+    fi
+    return 1
+}
+
+# Interactively pick a port. If $1=random, just call _pick_port (avoiding $2).
+# If $1=ask, prompt the operator and validate (range, numeric, in-use, distinct
+# from $2). Loops until a clean choice is made.
+_choose_port() {
+    local mode="$1" avoid="${2:-0}" label="${3:-port}" picked who
+    if [ "$mode" = "random" ]; then
+        _pick_port "$avoid"; return 0
+    fi
+    while :; do
+        printf '%sEnter %s port (1-65535) [blank = random]: %s' \
+            "$_c_byellow" "$label" "$_c_reset" >&2
+        read -r picked </dev/tty
+        if [ -z "$picked" ]; then
+            _pick_port "$avoid"; return 0
+        fi
+        case "$picked" in
+            *[!0-9]*) _err "not a number: $picked" ; continue ;;
+        esac
+        if [ "$picked" -lt 1 ] || [ "$picked" -gt 65535 ]; then
+            _err "out of range (1-65535): $picked" ; continue
+        fi
+        if [ "$picked" = "$avoid" ]; then
+            _err "must differ from the other port ($avoid)" ; continue
+        fi
+        if [ "$picked" -lt 1024 ] && [ "$(id -u)" != "0" ]; then
+            _warn "port $picked is privileged — needs root. Re-run with sudo or choose >=1024."
+            continue
+        fi
+        if _in_use "$picked"; then
+            who=$(_who_uses_port "$picked")
+            if [ -n "$who" ]; then
+                _err "port $picked already in use by: $who"
+            else
+                _err "port $picked already in use (process owned by another user — re-run with sudo to see who, or pick another)"
+            fi
+            continue
+        fi
+        printf '%s' "$picked"
+        return 0
+    done
+}
+
 _pick_port() {
     local attempt=0 raw p
     while [ "$attempt" -lt 50 ]; do
@@ -106,8 +184,43 @@ if [ -z "$SERVE_IP" ]; then
     exit 1
 fi
 
-ARSENAL_PORT=$(_pick_port)
-CVE_PORT=$(_pick_port "$ARSENAL_PORT")
+# ── Port mode: random (default) or operator-specified ───────────────────────
+PORT_MODE="random"
+if [ -n "${ARSENAL_PORT:-}" ] || [ -n "${CVE_PORT:-}" ]; then
+    # Env-var override — skip prompt entirely
+    PORT_MODE="env"
+else
+    printf '%sUse random ports? [Y/n]: %s' "$_c_byellow" "$_c_reset"
+    read -r _port_ans
+    case "${_port_ans:-Y}" in
+        n|N|no|NO) PORT_MODE="ask" ;;
+        *)        PORT_MODE="random" ;;
+    esac
+fi
+
+case "$PORT_MODE" in
+    random)
+        ARSENAL_PORT=$(_choose_port random)
+        CVE_PORT=$(_choose_port random "$ARSENAL_PORT")
+        ;;
+    ask)
+        ARSENAL_PORT=$(_choose_port ask 0 "arsenal")
+        CVE_PORT=$(_choose_port ask "$ARSENAL_PORT" "CVE PoCs")
+        ;;
+    env)
+        ARSENAL_PORT="${ARSENAL_PORT:-$(_pick_port)}"
+        CVE_PORT="${CVE_PORT:-$(_pick_port "$ARSENAL_PORT")}"
+        if [ "$ARSENAL_PORT" = "$CVE_PORT" ]; then
+            _err "ARSENAL_PORT and CVE_PORT must differ"; exit 1
+        fi
+        for _p in "$ARSENAL_PORT" "$CVE_PORT"; do
+            if _in_use "$_p"; then
+                _err "port $_p (from env) already in use: $(_who_uses_port "$_p")"
+                exit 1
+            fi
+        done
+        ;;
+esac
 
 printf '\n%s[+] Interface : %s (%s)%s\n' "$_c_bgreen" "$SELECTED_IFACE" "$SERVE_IP" "$_c_reset"
 printf '%s[+] Arsenal   : port %s%s\n' "$_c_bgreen" "$ARSENAL_PORT" "$_c_reset"
